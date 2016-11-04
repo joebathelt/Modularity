@@ -34,6 +34,7 @@ def main():
         import nipype.algorithms.misc as misc
         from additional_interfaces import FAconnectome
         from additional_interfaces import DipyDenoise
+        from additional_pipelines import DWIPreproc
         from additional_pipelines import T1Preproc
         from additional_pipelines import SubjectSpaceParcellation
         from own_nipype import Extractb0 as extract_b0
@@ -74,6 +75,10 @@ def main():
 
         # DWI processing
         dwi_preproc = pe.Node(interface=DWIPreproc(), name='dwi_preproc')
+        dwi_preproc.inputs.out_directory = out_directory
+
+        gunzip = pe.Node(interface=misc.Gunzip(), name='gunzip')
+        fsl2mrtrix = pe.Node(interface=mrt.FSL2MRTrix(invert_x=True), name='fsl2mrtrix')
 
         # Eroding the brain mask
         erode_mask_firstpass = pe.Node(
@@ -115,16 +120,15 @@ def main():
         subject_parcellation.inputs.source_annot_file = 'aparc.a2009s'
         subject_parcellation.inputs.out_directory = out_directory
 
-        # Co-registering T1 and FA
+        # Co-registering FA and T1
+        flt = pe.Node(interface=fsl.FLIRT(reference=registration_reference, dof=6, cost_func='mutualinfo'), name='flt')
+
         dwi_to_T1_flirt = pe.Node(interface=fsl.FLIRT(), name='dwi_to_T1_flirt')
         dwi_to_T1_flirt.inputs.cost_func = 'mutualinfo'
         dwi_to_T1_flirt.inputs.dof = 6
         dwi_to_T1_flirt.inputs.out_matrix_file = 'subjectDWI_to_T1.mat'
 
         dwi_to_t1 = pe.Node(interface=fsl.ApplyXfm(apply_xfm=True), name='dwi_to_t1')
-
-        # Moving tracts to T1 space
-        trkcoreg = pe.Node(interface=trk_Coreg(), name='trkcoreg')
 
         # calcuating the connectome matrix
         calc_matrix = pe.Node(interface=FAconnectome(), name='calc_matrix')
@@ -136,29 +140,15 @@ def main():
         # Reading in files
         connectome.connect(infosource, 'subject_id', selectfiles, 'subject_id')
 
-        # Denoising
-        connectome.connect(selectfiles, 'dwi', denoise, 'in_file')
-
-        # Eddy current and motion correction
-        connectome.connect(denoise, 'out_file', eddycorrect, 'in_file')
-        connectome.connect(eddycorrect, 'eddy_corrected', extract_b0, 'in_file')
-        connectome.connect(eddycorrect, 'eddy_corrected', gunzip, 'in_file')
-
-        # Brain extraction
-        connectome.connect(extract_b0, 'out_file', bet, 'in_file')
-
-        # Creating tensor maps
-        connectome.connect(selectfiles, 'bval', fsl2mrtrix, 'bval_file')
-        connectome.connect(selectfiles, 'bvec', fsl2mrtrix, 'bvec_file')
-        connectome.connect(gunzip, 'out_file', dwi2tensor, 'in_file')
-        connectome.connect(fsl2mrtrix, 'encoding_file', dwi2tensor, 'encoding_file')
-        connectome.connect(dwi2tensor, 'tensor', tensor2vector, 'in_file')
-        connectome.connect(dwi2tensor, 'tensor', tensor2adc, 'in_file')
-        connectome.connect(dwi2tensor, 'tensor', tensor2fa, 'in_file')
-        connectome.connect(tensor2fa, 'FA', MRmult_merge, 'in1')
+        # DWI preprocessing
+        connectome.connect(infosource, 'subject_id', dwi_preproc, 'subject_id')
+        connectome.connect(selectfiles, 'dwi', dwi_preproc, 'dwi')
+        connectome.connect(selectfiles, 'bval', dwi_preproc, 'bval')
+        connectome.connect(selectfiles, 'bvec', dwi_preproc, 'bvec')
 
         # Thresholding to create a mask of single fibre voxels
-        connectome.connect(gunzip2, 'out_file', erode_mask_firstpass, 'in_file')
+        connectome.connect(dwi_preproc, 'FA', MRmult_merge, 'in1')
+        connectome.connect(dwi_preproc, 'mask', erode_mask_firstpass, 'in_file')
         connectome.connect(erode_mask_firstpass, 'out_file',
                            erode_mask_secondpass, 'in_file')
         connectome.connect(erode_mask_secondpass, 'out_file', MRmult_merge, 'in2')
@@ -166,41 +156,44 @@ def main():
         connectome.connect(MRmultiply, 'out_file', threshold_FA, 'in_file')
 
         # Create seed mask
-        connectome.connect(gunzip, 'out_file', gen_WM_mask, 'in_file')
-        connectome.connect(bet, 'mask_file', gunzip2, 'in_file')
-        connectome.connect(gunzip2, 'out_file', gen_WM_mask, 'binary_mask')
+        connectome.connect(dwi_preproc, 'dwi', gen_WM_mask, 'in_file')
+        connectome.connect(dwi_preproc, 'mask', gen_WM_mask, 'binary_mask')
         connectome.connect(fsl2mrtrix, 'encoding_file', gen_WM_mask, 'encoding_file')
         connectome.connect(gen_WM_mask, 'WMprobabilitymap', threshold_wmmask, 'in_file')
 
         # Estimate response
-        connectome.connect(gunzip, 'out_file', estimateresponse, 'in_file')
+        connectome.connect(selectfiles, 'bval', fsl2mrtrix, 'bval_file')
+        connectome.connect(selectfiles, 'bvec', fsl2mrtrix, 'bvec_file')
         connectome.connect(fsl2mrtrix, 'encoding_file', estimateresponse, 'encoding_file')
+        connectome.connect(dwi_preproc, 'dwi', estimateresponse, 'in_file')
         connectome.connect(threshold_FA, 'out_file', estimateresponse, 'mask_image')
 
         # CSD calculation
-        connectome.connect(gunzip, 'out_file', csdeconv, 'in_file')
+        connectome.connect(dwi_preproc, 'dwi', csdeconv, 'in_file')
         connectome.connect(gen_WM_mask, 'WMprobabilitymap', csdeconv, 'mask_image')
         connectome.connect(estimateresponse, 'response', csdeconv, 'response_file')
         connectome.connect(fsl2mrtrix, 'encoding_file', csdeconv, 'encoding_file')
 
         # Running the tractography
-        connectome.connect(threshold_wmmask, "out_file", probCSDstreamtrack, "seed_file")
-        connectome.connect(csdeconv, "spherical_harmonics_image", probCSDstreamtrack, "in_file")
-        connectome.connect(gunzip, "out_file", tck2trk, "image_file")
-        connectome.connect(probCSDstreamtrack, "tracked", tck2trk, "in_file")
+        connectome.connect(threshold_wmmask, 'out_file', probCSDstreamtrack, 'seed_file')
+        connectome.connect(csdeconv, 'spherical_harmonics_image', probCSDstreamtrack, 'in_file')
+        connectome.connect(dwi_preproc, 'dwi', tck2trk, 'image_file')
+        connectome.connect(probCSDstreamtrack, 'tracked', tck2trk, 'in_file')
 
         # Smoothing the trackfile
         connectome.connect(tck2trk, 'out_file', smooth, 'track_file')
 
-
-        # Moving tracts to common space
-        connectome.connect(smooth, 'smoothed_track_file', trkcoreg, 'in_file')
-        connectome.connect(mrconvert, 'converted', trkcoreg, 'FA_file')
-        connectome.connect(flt, 'out_matrix_file', trkcoreg, 'transfomation_matrix')
+        # Moving T1 to dwi space
+        connectome.connect(dwi_preproc, 'b0', flt, 'reference')
+        connectome.connect(selectfiles, 'T1', flt, 'in_file')
+        connectome.connect(flt, 'out_file', t1_preproc, 'T1')
+        connectome.connect(t1_preproc, 'wm', subject_parcellation, 'wm')
+        connectome.connect(t1_preproc, 'subjects_dir', subject_parcellation, 'subjects_dir')
+        connectome.connect(t1_preproc, 'subject_id', subject_parcellation, 'subject_id')
 
         # Calculating the FA connectome
-        connectome.connect(trkcoreg, 'transformed_track_file', calc_matrix, 'trackfile')
-        connectome.connect(tensor2fa, 'FA', calc_matrix, 'FA_file')
+        connectome.connect(smooth, 'smoothed_track_file', calc_matrix, 'trackfile')
+        connectome.connect(dwi_preproc, 'FA', calc_matrix, 'FA_file')
         connectome.connect(subject_parcellation, 'cortical_expanded', calc_matrix, 'ROI_file')
 
         # ==================================================================

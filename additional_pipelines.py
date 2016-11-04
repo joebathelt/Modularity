@@ -13,15 +13,16 @@ class DWIPreprocInputSpec(BaseInterfaceInputSpec):
     dwi = File(desc='diffusion-weighted image', mandatory=True)
     subject_id = traits.String(desc='subject ID', mandatory=True)
     out_directory = File(
-        desc='directory where to output should be directed', mandatory=True)
-
+        desc='directory where to dwi should be directed', mandatory=True)
 
 class DWIPreprocOutputSpec(TraitedSpec):
     AD = File(exist=True, desc='axial diffusivity image')
     FA = File(exist=True, desc='fractional anisotropy image')
     MD = File(exist=True, desc='mean diffusivity image')
     RD = File(exist=True, desc='radial diffusivity image')
-
+    dwi = File(exist=True, desc='processing diffusion-weighted image')
+    mask = File(exist=True, desc='brain mask')
+    b0 = File(exist=True, desc='b0 volume')
 
 class DWIPreproc(BaseInterface):
     input_spec = DWIPreprocInputSpec
@@ -33,6 +34,7 @@ class DWIPreproc(BaseInterface):
         from additional_interfaces import AdditionalDTIMeasures
         from additional_interfaces import DipyDenoise
         import nipype.interfaces.fsl as fsl
+        import nipype.interfaces.io as nio
         import nipype.pipeline.engine as pe
         import os
 
@@ -65,6 +67,12 @@ class DWIPreproc(BaseInterface):
         # Getting AD and RD
         get_rd = pe.Node(interface=AdditionalDTIMeasures(), name='get_rd')
 
+        # DataSink
+        datasink = pe.Node(interface=nio.DataSink(), name='datasink')
+        datasink.inputs.parameterization = False
+        datasink.inputs.base_directory = self.inputs.out_directory
+        datasink.inputs.container = self.inputs.subject_id
+
         # ==============================================================
         # Setting up the workflow
         dwi_preprocessing = pe.Workflow(name='dwi_preprocessing')
@@ -83,22 +91,37 @@ class DWIPreproc(BaseInterface):
         dwi_preprocessing.connect(dtifit, 'L2', get_rd, 'L2')
         dwi_preprocessing.connect(dtifit, 'L3', get_rd, 'L3')
 
+        # Connecting to the datasink
+        dwi_preprocessing.connect(bet, 'out_file', datasink, 'dwi.@b0')
+        dwi_preprocessing.connect(bet, 'out_file', datasink, 'dwi.@dwi')
+        dwi_preprocessing.connect(bet, 'mask_file', datasink, 'dwi.@mask')
+        dwi_preprocessing.connect(dtifit, 'FA', datasink, 'dwi.@FA')
+        dwi_preprocessing.connect(dtifit, 'MD', datasink, 'dwi.@MD')
+        dwi_preprocessing.connect(get_rd, 'AD', datasink, 'dwi.@AD')
+        dwi_preprocessing.connect(get_rd, 'RD', datasink, 'dwi.@RD')
+
         # ==============================================================
         # Running the workflow
         dwi_preprocessing.base_dir = os.path.abspath(self.inputs.out_directory)
+        dwi_preprocessing.write_graph()
         dwi_preprocessing.run()
 
         return runtime
 
     def _list_outputs(self):
-        from nipype.utils.filemanip import split_filename
         import os
         outputs = self._outputs().get()
-        _, base, _ = split_filename(self.inputs.dwi)
-        outputs["AD"] = os.path.abspath(base + '_AD.nii.gz')
-        outputs["FA"] = os.path.abspath(base + '_FA.nii.gz')
-        outputs["MD"] = os.path.abspath(base + '_MD.nii.gz')
-        outputs["RD"] = os.path.abspath(base + '_RD.nii.gz')
+        out_directory = self.inputs.out_directory
+        subject_id = self.inputs.subject_id
+
+        outputs["AD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_AD.nii.gz')
+        outputs["b0"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_b0.nii.gz')
+        outputs["FA"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_FA.nii.gz')
+        outputs["MD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_MD.nii.gz')
+        outputs["RD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_RD.nii.gz')
+        outputs["dwi"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_dwi.nii.gz')
+        outputs["mask"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_mask.nii.gz')
+
         return outputs
 
 # ======================================================================
@@ -110,7 +133,7 @@ class T1PreprocInputSpec(BaseInterfaceInputSpec):
     template_directory = File(
         exist=True, desc='directory where template files are stored')
     out_directory = File(
-        exist=True, desc='directory where FreeSurfer output should be directed')
+        exist=True, desc='directory where FreeSurfer dwi should be directed')
 
 
 class T1PreprocOutputSpec(TraitedSpec):
@@ -196,7 +219,7 @@ class T1Preproc(BaseInterface):
         T1_preprocessing.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
         T1_preprocessing.connect(T1_denoise, 'out_file', n4, 'input_image')
         T1_preprocessing.connect(
-            n4, 'output_image', brainextraction, 'anatomical_image')
+            n4, 'dwi_image', brainextraction, 'anatomical_image')
         T1_preprocessing.connect(
             brainextraction, 'BrainExtractionBrain', autorecon1, 'T1_files')
         T1_preprocessing.connect(
@@ -246,7 +269,7 @@ class SubjectSpaceParcellationInputSpec(BaseInterfaceInputSpec):
     source_subject = traits.String(desc='subject ID')
     source_annot_file = File(exist=True, desc='T1-weighted anatomical image')
     out_directory = File(
-        exist=True, desc='directory where FreeSurfer output should be directed')
+        exist=True, desc='directory where FreeSurfer dwi should be directed')
     wm = File(exit=True, desc='segmented white matter image')
 
 class SubjectSpaceParcellationOutputSpec(TraitedSpec):
