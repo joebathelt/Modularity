@@ -250,7 +250,7 @@ class T1Preproc(BaseInterface):
         mask_convert.inputs.out_type = 'niigz'
 
         # Connecting the pipeline
-        T1_preproc = pe.Workflow(name='T1_preproc')
+        T1_preproc = pe.Workflow(name='t1_preproc')
 
         T1_preproc.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
         T1_preproc.connect(T1_denoise, 'out_file', n4, 'input_image')

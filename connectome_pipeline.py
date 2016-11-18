@@ -24,12 +24,17 @@ def main():
     out_directory = options.out_directory
     subject_list = options.subject_list
     subject_list = [subject for subject in subject_list.split(
-        ',') if re.search('CBU', subject)]
+        ',') if subject]
     template_directory = options.template_directory
     parcellation_directory = options.parcellation_directory
     acquisition_parameters = options.acquisition_parameters
     index_file = options.index_file
     subjects_dir = out_directory + '/connectome/FreeSurfer/'
+
+    if not os.path.isdir(out_directory + '/connectome/'):
+        os.mkdir(out_directory + '/connectome/')
+        os.mkdir(subjects_dir)
+
     os.environ['SUBJECTS_DIR'] = subjects_dir
 
     def connectome(subject_list, base_directory, out_directory):
