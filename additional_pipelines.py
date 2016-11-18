@@ -4,12 +4,15 @@ from nipype.interfaces.base import File
 from nipype.interfaces.base import traits
 from nipype.interfaces.base import TraitedSpec
 
+
 # ======================================================================
 # DWI preprocessing
 
 class DWIPreprocInputSpec(BaseInterfaceInputSpec):
-    bval = File(desc='bval file', mandatory=True)
-    bvec = File(desc='bvec file', mandatory=True)
+    acqparams = File(desc='File with acquisition parameters for the diffusion sequence for FSL eddy', mandatory=True)
+    bvals = File(desc='bval file', mandatory=True)
+    bvecs = File(desc='bvec file', mandatory=True)
+    index_file = File(desc='File with indices of volumes used for the diffusion sequence for FSL eddy', mandatory=True)
     dwi = File(desc='diffusion-weighted image', mandatory=True)
     subject_id = traits.String(desc='subject ID', mandatory=True)
     out_directory = File(
@@ -36,33 +39,39 @@ class DWIPreproc(BaseInterface):
         import nipype.interfaces.fsl as fsl
         import nipype.interfaces.io as nio
         import nipype.pipeline.engine as pe
+        import nipype.interfaces.utility as util
         import os
 
         # ==============================================================
         # Processing of diffusion-weighted data
-        # Denoising
-        dwi_denoise = pe.Node(interface=DipyDenoise(), name='dwi_denoise')
-        dwi_denoise.inputs.in_file = self.inputs.dwi
-
-        # Eddy-current and motion correction
-        eddycorrect = pe.Node(interface=fsl.epi.EddyCorrect(), name='eddycorrect')
-        eddycorrect.inputs.ref_num = 0
-
         # Extract b0 image
         fslroi = pe.Node(interface=fsl.ExtractROI(), name='extract_b0')
+        fslroi.inputs.in_file = self.inputs.dwi
         fslroi.inputs.t_min = 0
         fslroi.inputs.t_size = 1
 
         # Create a brain mask
         bet = pe.Node(interface=fsl.BET(
-            frac=0.3, robust=False, mask=True), name='bet')
+            frac=0.3, robust=False, mask=True, no_output=False), name='bet')
+
+        # Eddy-current and motion correction
+        eddy = pe.Node(interface=fsl.epi.Eddy(args='-v'), name='eddy')
+        eddy.inputs.in_acqp  = self.inputs.acqparams
+        eddy.inputs.in_bvec  = self.inputs.bvecs
+        eddy.inputs.in_bval  = self.inputs.bvals
+        eddy.inputs.in_file = self.inputs.dwi
+        eddy.inputs.in_index = self.inputs.index_file
+
+        # Denoising
+        dwi_denoise = pe.Node(interface=DipyDenoise(), name='dwi_denoise')
+        dwi_denoise.inputs.in_file = self.inputs.dwi
 
         # Fitting the diffusion tensor model
         dtifit = pe.Node(interface=fsl.DTIFit(), name='dtifit')
         dtifit.inputs.base_name = self.inputs.subject_id
         dtifit.inputs.dwi = self.inputs.dwi
-        dtifit.inputs.bvecs = self.inputs.bvec
-        dtifit.inputs.bvals = self.inputs.bval
+        dtifit.inputs.bvecs = self.inputs.bvecs
+        dtifit.inputs.bvals = self.inputs.bvals
 
         # Getting AD and RD
         get_rd = pe.Node(interface=AdditionalDTIMeasures(), name='get_rd')
@@ -70,62 +79,84 @@ class DWIPreproc(BaseInterface):
         # DataSink
         datasink = pe.Node(interface=nio.DataSink(), name='datasink')
         datasink.inputs.parameterization = False
-        datasink.inputs.base_directory = self.inputs.out_directory
-        datasink.inputs.container = self.inputs.subject_id
+        datasink.inputs.base_directory = self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id + '/dwi_preproc/'
+
+        # Renaming the outputs for consistency
+        AD_rename = pe.Node(interface=util.Rename(keep_ext = True), name='AD_rename')
+        AD_rename.inputs.format_string = self.inputs.subject_id + '_AD'
+
+        b0_rename = pe.Node(interface=util.Rename(keep_ext = True), name='b0_rename')
+        b0_rename.inputs.format_string = self.inputs.subject_id + '_b0'
+
+        dwi_rename = pe.Node(interface=util.Rename(keep_ext = True), name='dwi_rename')
+        dwi_rename.inputs.format_string = self.inputs.subject_id + '_dwi'
+
+        mask_rename = pe.Node(interface=util.Rename(keep_ext = True), name='mask_rename')
+        mask_rename.inputs.format_string = self.inputs.subject_id + '_mask'
+
+        RD_rename = pe.Node(interface=util.Rename(keep_ext = True), name='RD_rename')
+        RD_rename.inputs.format_string = self.inputs.subject_id + '_RD'
+
 
         # ==============================================================
         # Setting up the workflow
-        dwi_preprocessing = pe.Workflow(name='dwi_preprocessing')
+        dwi_preproc = pe.Workflow(name='dwi_preproc')
 
         # Diffusion data
         # Preprocessing
-        dwi_preprocessing.connect(
-            dwi_denoise, 'out_file', eddycorrect, 'in_file')
-        dwi_preprocessing.connect(
-            eddycorrect, 'eddy_corrected', fslroi, 'in_file')
-        dwi_preprocessing.connect(fslroi, 'roi_file', bet, 'in_file')
+        dwi_preproc.connect(fslroi, 'roi_file', bet, 'in_file')
+        dwi_preproc.connect(bet, 'mask_file', eddy, 'in_mask')
+        dwi_preproc.connect(eddy, 'out_corrected', dwi_denoise, 'in_file')
 
         # Calculate diffusion measures
-        dwi_preprocessing.connect(bet, 'mask_file', dtifit, 'mask')
-        dwi_preprocessing.connect(dtifit, 'L1', get_rd, 'L1')
-        dwi_preprocessing.connect(dtifit, 'L2', get_rd, 'L2')
-        dwi_preprocessing.connect(dtifit, 'L3', get_rd, 'L3')
+        dwi_preproc.connect(dwi_denoise, 'out_file', dtifit, 'dwi')
+        dwi_preproc.connect(bet, 'mask_file', dtifit, 'mask')
+        dwi_preproc.connect(dtifit, 'L1', get_rd, 'L1')
+        dwi_preproc.connect(dtifit, 'L2', get_rd, 'L2')
+        dwi_preproc.connect(dtifit, 'L3', get_rd, 'L3')
+
+        # Renaming same outputs
+        dwi_preproc.connect(dwi_denoise, 'out_file', dwi_rename, 'in_file')
+        dwi_preproc.connect(bet, 'out_file', b0_rename, 'in_file')
+        dwi_preproc.connect(bet, 'mask_file', mask_rename, 'in_file')
+        dwi_preproc.connect(get_rd, 'AD', AD_rename, 'in_file')
+        dwi_preproc.connect(get_rd, 'RD', RD_rename, 'in_file')
 
         # Connecting to the datasink
-        dwi_preprocessing.connect(bet, 'out_file', datasink, 'dwi.@b0')
-        dwi_preprocessing.connect(bet, 'out_file', datasink, 'dwi.@dwi')
-        dwi_preprocessing.connect(bet, 'mask_file', datasink, 'dwi.@mask')
-        dwi_preprocessing.connect(dtifit, 'FA', datasink, 'dwi.@FA')
-        dwi_preprocessing.connect(dtifit, 'MD', datasink, 'dwi.@MD')
-        dwi_preprocessing.connect(get_rd, 'AD', datasink, 'dwi.@AD')
-        dwi_preprocessing.connect(get_rd, 'RD', datasink, 'dwi.@RD')
+        dwi_preproc.connect(dwi_rename, 'out_file', datasink, 'preprocessed.@dwi')
+        dwi_preproc.connect(b0_rename, 'out_file', datasink, 'preprocessed.@b0')
+        dwi_preproc.connect(mask_rename, 'out_file', datasink, 'preprocessed.@mask')
+        dwi_preproc.connect(dtifit, 'FA', datasink, 'preprocessed.@FA')
+        dwi_preproc.connect(dtifit, 'MD', datasink, 'preprocessed.@MD')
+        dwi_preproc.connect(AD_rename, 'out_file', datasink, 'preprocessed.@AD')
+        dwi_preproc.connect(RD_rename, 'out_file', datasink, 'preprocessed.@RD')
 
         # ==============================================================
         # Running the workflow
-        dwi_preprocessing.base_dir = os.path.abspath(self.inputs.out_directory)
-        dwi_preprocessing.write_graph()
-        dwi_preprocessing.run()
+        dwi_preproc.base_dir = os.path.abspath(self.inputs.out_directory + '_subject_id_' + self.inputs.subject_id)
+        dwi_preproc.write_graph()
+        dwi_preproc.run()
 
         return runtime
 
     def _list_outputs(self):
         import os
         outputs = self._outputs().get()
-        out_directory = self.inputs.out_directory
         subject_id = self.inputs.subject_id
 
-        outputs["AD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_AD.nii.gz')
-        outputs["b0"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_b0.nii.gz')
-        outputs["FA"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_FA.nii.gz')
-        outputs["MD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_MD.nii.gz')
-        outputs["RD"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_RD.nii.gz')
-        outputs["dwi"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_dwi.nii.gz')
-        outputs["mask"] = os.path.abspath(out_directory + '/' + subject_id + '/dwi/' + subject_id + '_mask.nii.gz')
+        outputs["AD"] = os.path.abspath('preprocessed/' + subject_id + '_AD.nii.gz')
+        outputs["b0"] = os.path.abspath('preprocessed/' + subject_id + '_b0.nii.gz')
+        outputs["FA"] = os.path.abspath('preprocessed/' + subject_id + '_FA.nii.gz')
+        outputs["MD"] = os.path.abspath('preprocessed/' + subject_id + '_MD.nii.gz')
+        outputs["RD"] = os.path.abspath('preprocessed/' + subject_id + '_RD.nii.gz')
+        outputs["dwi"] = os.path.abspath('preprocessed/' + subject_id + '_dwi.nii.gz')
+        outputs["mask"] = os.path.abspath('preprocessed/' + subject_id + '_mask.nii.gz')
 
         return outputs
 
 # ======================================================================
 # T1 preprocessing & FreeSurfer reconstruction
+
 
 class T1PreprocInputSpec(BaseInterfaceInputSpec):
     subject_id = traits.String(desc='subject ID')
@@ -134,7 +165,7 @@ class T1PreprocInputSpec(BaseInterfaceInputSpec):
         exist=True, desc='directory where template files are stored')
     out_directory = File(
         exist=True, desc='directory where FreeSurfer output should be directed')
-
+    parcellation_directory = File(exist=True, desc='directory containing the parcellation file')
 
 class T1PreprocOutputSpec(TraitedSpec):
     brainmask = File(exist=True, desc='brain mask generated by FreeSurfer')
@@ -151,7 +182,6 @@ class T1Preproc(BaseInterface):
     def _run_interface(self, runtime):
         from additional_interfaces import DipyDenoiseT1
         from additional_interfaces import FSRename
-        from additional_interfaces import FS_Gyrification
         from nipype.interfaces.ants import N4BiasFieldCorrection
         from nipype.interfaces.ants.segmentation import BrainExtraction
         from nipype.interfaces.freesurfer import MRIConvert
@@ -168,6 +198,8 @@ class T1Preproc(BaseInterface):
 
         if not os.path.isdir(subjects_dir):
             os.mkdir(subjects_dir)
+
+        os.environ['SUBJECTS_DIR'] = subjects_dir
 
         # Getting a better field of view
         robustfov = pe.Node(interface=fsl.RobustFOV(), name='robustfov')
@@ -205,9 +237,6 @@ class T1Preproc(BaseInterface):
         autorecon3 = pe.Node(interface=ReconAll(), name='autorecon3')
         autorecon3.inputs.directive = 'autorecon3'
 
-        gyrification = pe.Node(
-            interface=FS_Gyrification(), name='gyrification')
-
         wm_convert = pe.Node(interface=MRIConvert(), name='wm_convert')
         wm_convert.inputs.out_file = subjects_dir + '/' + subject_id + '/mri/' + 'wm.nii'
         wm_convert.inputs.out_type = 'nii'
@@ -221,39 +250,35 @@ class T1Preproc(BaseInterface):
         mask_convert.inputs.out_type = 'niigz'
 
         # Connecting the pipeline
-        T1_preprocessing = pe.Workflow(name='T1_preprocessing')
+        T1_preproc = pe.Workflow(name='T1_preproc')
 
-        T1_preprocessing.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
-        T1_preprocessing.connect(T1_denoise, 'out_file', n4, 'input_image')
-        T1_preprocessing.connect(
+        T1_preproc.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
+        T1_preproc.connect(T1_denoise, 'out_file', n4, 'input_image')
+        T1_preproc.connect(
             n4, 'output_image', brainextraction, 'anatomical_image')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             brainextraction, 'BrainExtractionBrain', autorecon1, 'T1_files')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon1, 'subject_id', autorecon2, 'subject_id')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon1, 'subjects_dir', autorecon2, 'subjects_dir')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon1, 'subject_id', rename, 'subject_id')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon1, 'subjects_dir', rename, 'subjects_dir')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon2, 'subject_id', autorecon3, 'subject_id')
-        T1_preprocessing.connect(
+        T1_preproc.connect(
             autorecon2, 'subjects_dir', autorecon3, 'subjects_dir')
-        T1_preprocessing.connect(autorecon3, 'wm', wm_convert, 'in_file')
-        T1_preprocessing.connect(autorecon3, 'T1', T1_convert, 'in_file')
-        T1_preprocessing.connect(
+        T1_preproc.connect(autorecon3, 'wm', wm_convert, 'in_file')
+        T1_preproc.connect(autorecon3, 'T1', T1_convert, 'in_file')
+        T1_preproc.connect(
             autorecon3, 'brainmask', mask_convert, 'in_file')
-        T1_preprocessing.connect(
-            autorecon3, 'subject_id', gyrification, 'subject_id')
-        T1_preprocessing.connect(
-            autorecon3, 'subjects_dir', gyrification, 'subjects_dir')
 
         # ==============================================================
         # Running the workflow
-        T1_preprocessing.base_dir = os.path.abspath(self.inputs.out_directory)
-        T1_preprocessing.run()
+        T1_preproc.base_dir = os.path.abspath(self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id)
+        T1_preproc.run()
 
         return runtime
 
@@ -261,7 +286,7 @@ class T1Preproc(BaseInterface):
         import os
 
         outputs = self._outputs().get()
-        directory = self.inputs.out_directory + '/FreeSurfer/' + self.inputs.subject_id
+        directory = self.inputs.out_directory + 'FreeSurfer/' + self.inputs.subject_id
         outputs["brainmask"] = os.path.abspath(directory + '/mri/' + 'brainmask.nii.gz')
         outputs["subjects_dir"] = os.path.abspath(self.inputs.out_directory + '/FreeSurfer/')
         outputs["subject_id"] = self.inputs.subject_id
@@ -278,14 +303,17 @@ class SubjectSpaceParcellationInputSpec(BaseInterfaceInputSpec):
     subject_id = traits.String(desc='subject ID')
     subjects_dir = File(exist=True, desc='FreeSufer subject directory')
     source_subject = traits.String(desc='subject ID')
-    source_annot_file = File(exist=True, desc='T1-weighted anatomical image')
+    source_annot_file = File(exist=True, desc='annotation file to be transformed')
+    parcellation_directory = File(desc='directory containing the subjects parcellations')
     out_directory = File(
-        exist=True, desc='directory where FreeSurfer dwi should be directed')
+        exist=True, desc='directory where FreeSurfer output should be directed')
     wm = File(exit=True, desc='segmented white matter image')
 
 class SubjectSpaceParcellationOutputSpec(TraitedSpec):
     subject_id = traits.String(desc='subject ID')
     subjects_dir = File(exist=True, desc='FreeSufer subject directory')
+    aparc = traits.String(desc="parcellation file")
+    aparc_subMask = File(exists=True, desc="DK atlas with subcortical regions masked out")
     cortical = File(exists=True, desc="cortical parcellation")
     cortical_consecutive = File(exists=True, desc="cortical parcellation with consecutive numbering")
     cortical_expanded = File(exists=True, desc="cortical parcellation expanded into WM")
@@ -304,8 +332,6 @@ class SubjectSpaceParcellationOutputSpec(TraitedSpec):
     whiteMatter_expanded = File(exists=True, desc="white matter partial image after expansion of cortical parcellation into WM")
     boundary_lh_rh = File(exists=True, desc="boundary label between hemisphere")
     boundary_sub_lh = File(exists=True, desc="oundary label between cortical and subcortical")
-    aparc = File(exists=True, desc="DK atlas")
-    aparc_subMask = File(exists=True, desc="DK atlas with subcortical regions masked out")
 
 class SubjectSpaceParcellation(BaseInterface):
     input_spec = SubjectSpaceParcellationInputSpec
@@ -323,8 +349,16 @@ class SubjectSpaceParcellation(BaseInterface):
         subjects_dir = self.inputs.subjects_dir
         source_subject = self.inputs.source_subject
         source_annot_file = self.inputs.source_annot_file
-        out_directory = self.inputs.out_directory
+        parcellation_directory = self.inputs.parcellation_directory
         wm = self.inputs.wm
+
+        if subjects_dir[:-1] == '/':
+            subjects_dir = subjects_dir + '/'
+
+        os.environ['SUBJECTS_DIR'] = subjects_dir
+
+        if not os.path.isdir(subjects_dir + '/' + source_subject):
+            os.symlink(parcellation_directory + '/' + source_subject, subjects_dir + '/' + source_subject)
 
         # Moving subparcellation of the atlas to subject space
         sxfm = pe.Node(interface=SurfaceTransform(), name='sxfm')
@@ -337,7 +371,7 @@ class SubjectSpaceParcellation(BaseInterface):
 
         # Transforming surface parcellation to volume
         aparc2aseg = pe.Node(interface=Aparc2Aseg(), name='aparc2aseg')
-        aparc2aseg.inputs.subjects_dir = subjects_dir
+        aparc2aseg.inputs.subjects_dir = subjects_dir + '/'
         aparc2aseg.inputs.annotation_file = source_annot_file
         aparc2aseg.inputs.hemi = 'lh'
 
@@ -347,7 +381,6 @@ class SubjectSpaceParcellation(BaseInterface):
         expand.inputs.subjects_dir = subjects_dir
         expand.inputs.parcellation_name = source_annot_file
         expand.inputs.dilatationVoxel = 2
-
 
         renum = pe.Node(interface=ReunumberParcels(), name='renum')
         renum.inputs.subjects_dir = subjects_dir
@@ -367,7 +400,7 @@ class SubjectSpaceParcellation(BaseInterface):
 
         # ==============================================================
         # Running the workflow
-        subject_parcellation.base_dir = os.path.abspath(self.inputs.out_directory)
+        subject_parcellation.base_dir = os.path.abspath(self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id)
         subject_parcellation.run()
 
         return runtime
@@ -380,7 +413,8 @@ class SubjectSpaceParcellation(BaseInterface):
         path_subj = self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/'
         parcellation_name = self.inputs.source_annot_file
 
-        outputs["cortical"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical.nii.gz')
+        outputs["aparc"] = self.inputs.source_annot_file
+        outputs["cortical"] = os.path.abspath(path_subj + '/parcellation/' + parcellation_name + '_cortical.nii.gz')
         outputs["cortical_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_consecutive.nii.gz')
         outputs["cortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_expanded.nii.gz')
         outputs["cortical_expanded_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_cortical_expanded_consecutive.nii.gz')
@@ -394,6 +428,8 @@ class SubjectSpaceParcellation(BaseInterface):
         outputs["rightHemisphere_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_rightHemisphere_expanded.nii.gz')
         outputs["subcortical"] = os.path.abspath(path_subj + 'parcellation/' +parcellation_name +  '_subcortical.nii.gz')
         outputs["subcortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_subcortical_expanded.nii.gz')
+        outputs["subject_id"] = self.inputs.subject_id
+        outputs["subjects_dir"] = self.inputs.subjects_dir
         outputs["whiteMatter"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter.nii.gz')
         outputs["whiteMatter_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter_expanded.nii.gz')
         outputs["boundary_lh_rh"] = os.path.abspath(path_subj + 'parcellation/' + 'boundary_lh_rh.txt')

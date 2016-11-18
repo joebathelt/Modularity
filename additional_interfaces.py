@@ -108,9 +108,243 @@ class Aparc2Aseg(BaseInterface):
         outputs = self._outputs().get()
         outputs['subject_id'] = self.inputs.subject_id
         outputs['volume_parcellation'] = os.path.abspath(
-            self.inputs.subjects_dir + self.inputs.subject_id + '/parcellation/' + self.inputs.annotation_file + '.nii.gz')
+            self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/parcellation/' + self.inputs.annotation_file + '.nii.gz')
         return outputs
 
+
+# ======================================================================
+# Calculate the connectivity matrix
+
+class CalcMatrixInputSpec(BaseInterfaceInputSpec):
+    track_file = File(
+        exists=True, desc='whole-brain tractography in .trk format', mandatory=True)
+    ROI_file = File(
+        exists=True, desc='image containing the ROIs', mandatory=True)
+    scalar_file = File(
+        exists=True, desc='fractional anisotropy map in the same soace as the track file', mandatory=True)
+    output_file = File(
+        "scalar_matrix.txt", desc="Adjacency matrix of ROIs with scalar as conenction weight", usedefault=True)
+    threshold = traits.Int(desc="Threshold of number of streamlines to retain")
+
+class CalcMatrixOutputSpec(TraitedSpec):
+    density_matrix = File(exists=True, desc="connectivity matrix based on the number of streamlines between each pair of ROIs")
+    length_normalized_matrix = File(exists=True, desc="streamline density matrix normalized by the length of the streamlines between ROIs")
+    scalar_matrix = File(exists=True, desc="connectivity matrix of scalar between each pair of ROIs")
+    size_normalized_matrix = File(exists=True, desc="streamline density matrix normalized by the combined volume of the ROIs")
+
+
+class CalcMatrix(BaseInterface):
+    input_spec = CalcMatrixInputSpec
+    output_spec = CalcMatrixOutputSpec
+
+    def _run_interface(self, runtime):
+        # Loading the ROI file
+        import nibabel as nib
+        import numpy as np
+        from dipy.tracking import utils
+
+
+        img = nib.load(self.inputs.ROI_file)
+        labels = img.get_data()
+        labels_affine = img.get_affine()
+
+        # Getting the scalar data
+        img = nib.load(self.inputs.scalar_file)
+        scalar_data = img.get_data()
+        scalar_affine = img.get_affine()
+        scalar_affine = np.matrix.round(scalar_affine)
+
+        # Loading the streamlines
+        streamlines = np.load(self.inputs.track_file)
+
+        # Only keeping streamlines that pass through the ROIs
+        ROI_mask = labels > 0
+        target_streamlines = utils.target(streamlines, ROI_mask, affine=scalar_affine)
+
+        # Constructing the streamlines matrix
+        matrix, mapping = utils.connectivity_matrix(
+            streamlines=target_streamlines, label_volume=labels.astype('int'), affine=scalar_affine, symmetric=True, return_mapping=True, mapping_as_streamlines=True)
+        matrix[matrix < self.inputs.threshold] = 0
+
+        # Removing the background label
+        matrix = matrix[1:, :]
+        matrix = matrix[:, 1:]
+
+        # Saving the density matrix
+        from nipype.utils.filemanip import split_filename
+        _, base, _ = split_filename(self.inputs.track_file)
+        np.savetxt(base + '_' + str(self.inputs.threshold) + '_matrix.txt', matrix, delimiter='\t')
+
+        # Density matrix normalized by ROI size
+        ROI_sizes = [np.sum(labels[labels == ROI]) for ROI in np.unique(labels)[1:]]
+        size_matrix = np.zeros(shape=np.repeat(len(np.unique(labels)[1:]),2))
+
+        for ROI1 in range(0,len(np.unique(labels)[1:])):
+            for ROI2 in range(0,len(np.unique(labels)[1:])):
+                size_matrix[ROI1, ROI2] = ROI_sizes[ROI1] + ROI_sizes[ROI2]
+
+        np.savetxt(base + '_' + str(self.inputs.threshold) + '_matrix_ROI_normalized.txt', matrix/size_matrix, delimiter='\t')
+
+        # Density matrix normalized by streamline length
+        length_matrix = np.zeros(shape=np.repeat(len(np.unique(labels)[1:]),2))
+
+        for ROI1 in range(0,len(np.unique(labels)[1:])):
+            for ROI2 in range(0,len(np.unique(labels)[1:])):
+                length_matrix[ROI1, ROI2] = np.median(list(utils.length(mapping[ROI1, ROI2])))
+
+        length_matrix[np.tril_indices(n=len(length_matrix))] = 0
+        length_matrix = length_matrix.T + length_matrix - np.diagonal(length_matrix)
+
+        np.savetxt(base + '_' + str(self.inputs.threshold) + '_matrix_length_normalized.txt', matrix/length_matrix, delimiter='\t')
+
+        # Constructing the scalar matrix
+        dimensions = matrix.shape
+        scalar_matrix = np.empty(shape=dimensions)
+
+        for i in range(0, dimensions[0]):
+            for j in range(0, dimensions[1]):
+                if matrix[i, j]:
+                    dm = utils.density_map(
+                        mapping[i, j], scalar_data.shape, affine=scalar_affine)
+                    scalar_matrix[i, j] = np.mean(scalar_data[dm > 5])
+                else:
+                    scalar_matrix[i, j] = 0
+
+        scalar_matrix[np.tril_indices(n=len(scalar_matrix))] = 0
+        scalar_matrix = scalar_matrix.T + scalar_matrix - np.diagonal(scalar_matrix)
+
+        # Saving the scalar matrix
+        from nipype.utils.filemanip import split_filename
+        _, base, _ = split_filename(self.inputs.scalar_file)
+        np.savetxt(base + '_matrix.txt', scalar_matrix, delimiter='\t')
+        return runtime
+
+    def _list_outputs(self):
+        from nipype.utils.filemanip import split_filename
+        import os
+        outputs = self._outputs().get()
+        _, base, _ = split_filename(self.inputs.scalar_file)
+        outputs["scalar_matrix"] = os.path.abspath(base + '_matrix.txt')
+
+        _, base, _ = split_filename(self.inputs.track_file)
+        outputs["density_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix.txt')
+
+        outputs["length_normalized_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix_length_normalized.txt')
+        outputs["size_normalized_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix_ROI_normalized')
+        return outputs
+
+# ==================================================================
+# Deterministic trackign with a CSD model
+
+class CSDdetInputSpec(BaseInterfaceInputSpec):
+    in_file = File(exists=True, desc='diffusion weighted volume', mandatory=True)
+    bval = File(exists=True, desc='FSL-style b-value file', mandatory=True)
+    bvec = File(exists=True, desc='FSL-style b-vector file', mandatory=True)
+    FA = File(exists=True, desc='FA map', mandatory=True)
+    brain_mask = File(exists=True, desc='FA map', mandatory=True)
+
+class CSDdetOutputSpec(TraitedSpec):
+    out_file = File(exists=True, desc="streamlines in NumPy format")
+    out_track = File(exists=True, desc="tracks in Trackvis format")
+
+class CSDdet(BaseInterface):
+    input_spec = CSDdetInputSpec
+    output_spec = CSDdetOutputSpec
+
+    def _run_interface(self, runtime):
+        import numpy as np
+        import nibabel as nib
+        from dipy.core.gradients import gradient_table
+        from nipype.utils.filemanip import split_filename
+        from dipy.tracking import utils
+        from dipy.reconst.shm import CsaOdfModel
+        from dipy.data import default_sphere
+        from dipy.direction import peaks_from_model
+        from dipy.tracking.local import ThresholdTissueClassifier
+        from dipy.reconst.csdeconv import ConstrainedSphericalDeconvModel
+        from dipy.reconst.csdeconv import auto_response
+        from dipy.direction import DeterministicMaximumDirectionGetter
+        from dipy.tracking.local import LocalTracking
+        from dipy.io.trackvis import save_trk
+
+        bvec = self.inputs.bvec
+        bval = self.inputs.bval
+        FA_fname = self.inputs.FA
+        fname = self.inputs.in_file
+        mask_fname = self.inputs.brain_mask
+
+        # Loading the data
+        img = nib.load(fname)
+        data = img.get_data()
+        affine = img.get_affine()
+
+        FA_img = nib.load(FA_fname)
+        fa = FA_img.get_data()
+        affine = FA_img.get_affine()
+        affine = np.matrix.round(affine)
+
+        mask_img = nib.load(mask_fname)
+        mask = mask_img.get_data()
+
+        bval_fname = self.inputs.bval
+        bvals = np.loadtxt(bval_fname)
+
+        bvec_fname = self.inputs.bvec
+        bvecs = np.loadtxt(bvec_fname)
+        bvecs = np.vstack([-1*bvecs[0,:],bvecs[1,:],bvecs[2,:]]).T
+        gtab = gradient_table(bvals, bvecs)
+
+        # Creating a white matter mask
+        fa = fa*mask
+        white_matter = fa >= 0.2
+
+        # Creating a seed mask
+        seeds = utils.seeds_from_mask(white_matter, density=1, affine=affine)
+
+        # Fitting the CSA model
+        csa_model = CsaOdfModel(gtab, sh_order=8)
+        csa_peaks = peaks_from_model(csa_model, data, default_sphere,
+                                     relative_peak_threshold=.8,
+                                     min_separation_angle=30,
+                                     mask=white_matter)
+        classifier = ThresholdTissueClassifier(csa_peaks.gfa, .1)
+        streamlines = LocalTracking(csa_peaks, classifier, seeds, affine, step_size=.5)
+
+        # Compute streamlines and store as a list.
+        streamlines = list(streamlines)
+
+        # Saving the tracks in NumPy format
+        _, base, _ = split_filename(fname)
+        np.save(base + '_CSDdet.npy', np.array(streamlines, dtype=np.object))
+
+        # Make a trackvis header so we can save streamlines
+        voxel_size = FA_img.get_header().get_zooms()
+        trackvis_header = nib.trackvis.empty_header()
+        trackvis_header['voxel_size'] = voxel_size
+        trackvis_header['dim'] = np.shape(fa)
+        trackvis_header['voxel_order'] = "RAS"
+
+        # Move streamlines to "trackvis space"
+        trackvis_point_space = utils.affine_for_trackvis(voxel_size)
+        streamlines = utils.move_streamlines(streamlines, trackvis_point_space, input_space=affine)
+        streamlines = list(streamlines)
+        nib.trackvis.aff_to_hdr(trackvis_point_space, trackvis_header)
+
+        # Save streamlines in Trackvis format
+        for_save = [(sl, None, None) for sl in streamlines]
+        nib.trackvis.write(base + '_CSDdet.trk', for_save, trackvis_header)
+        return runtime
+
+    def _list_outputs(self):
+        from nipype.utils.filemanip import split_filename
+        import os
+
+        outputs = self._outputs().get()
+        fname = self.inputs.in_file
+        _, base, _ = split_filename(fname)
+        outputs["out_file"] = os.path.abspath(base + '_CSDdet.npy')
+        outputs["out_track"] = os.path.abspath(base + '_CSDdet.trk')
+        return outputs
 
 # ==================================================================
 """
@@ -258,6 +492,59 @@ class DipyDenoise(BaseInterface):
 
         _, base, _ = split_filename(fname)
         nib.save(nib.Nifti1Image(denoised_data, affine),
+                 base + '_denoised.nii.gz')
+
+        return runtime
+
+    def _list_outputs(self):
+        from nipype.utils.filemanip import split_filename
+        import os
+        outputs = self._outputs().get()
+        fname = self.inputs.in_file
+        _, base, _ = split_filename(fname)
+        outputs["out_file"] = os.path.abspath(base + '_denoised.nii.gz')
+        return outputs
+
+
+# ==================================================================
+"""
+Denoising with non-local means for 3D images
+This function is based on the example in the Dipy preprocessing tutorial:
+http://nipy.org/dipy/examples_built/denoise_nlmeans.html#example-denoise-nlmeans
+"""
+
+
+class DipyDenoiseT1InputSpec(BaseInterfaceInputSpec):
+    in_file = File(
+        exists=True, desc='diffusion weighted volume for denoising', mandatory=True)
+
+
+class DipyDenoiseT1OutputSpec(TraitedSpec):
+    out_file = File(exists=True, desc="denoised diffusion-weighted volume")
+
+
+class DipyDenoiseT1(BaseInterface):
+    input_spec = DipyDenoiseT1InputSpec
+    output_spec = DipyDenoiseT1OutputSpec
+
+    def _run_interface(self, runtime):
+        import nibabel as nib
+        import numpy as np
+        from dipy.denoise.nlmeans import nlmeans
+        from nipype.utils.filemanip import split_filename
+
+        fname = self.inputs.in_file
+        img = nib.load(fname)
+        data = img.get_data()
+        affine = img.get_affine()
+        mask = data > 20
+
+        # Calculating the standard deviation of the noise
+        sigma = np.std(data[~mask])
+        denoised_data = nlmeans(data, sigma=sigma, mask=mask)
+
+        _, base, _ = split_filename(fname)
+        nib.save(nib.Nifti1Image(denoised_data, affine),
                  base + '_denoised.nii')
 
         return runtime
@@ -270,7 +557,6 @@ class DipyDenoise(BaseInterface):
         _, base, _ = split_filename(fname)
         outputs["out_file"] = os.path.abspath(base + '_denoised.nii')
         return outputs
-
 
 # ==================================================================
 """
@@ -360,7 +646,7 @@ class ExpandParcels(BaseInterface):
 
         path_subj = self.inputs.subjects_dir + self.inputs.subject_id
         nib.save(nib.Nifti1Image(newVol, affine),
-                 self.inputs.subjects_dir + self.inputs.subject_id + '/parcellation/' + self.inputs.parcellation_name  + '_expanded.nii.gz')
+                 self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/parcellation/' + self.inputs.parcellation_name  + '_expanded.nii.gz')
 
         return runtime
 
@@ -368,7 +654,7 @@ class ExpandParcels(BaseInterface):
         from nipype.utils.filemanip import split_filename
         import os
         outputs = self._outputs().get()
-        outputs["out_file"] = os.path.abspath(self.inputs.subjects_dir + self.inputs.subject_id + '/parcellation/' + self.inputs.parcellation_name  + '_expanded.nii.gz')
+        outputs["out_file"] = os.path.abspath(self.inputs.subjects_dir + '/' +self.inputs.subject_id + '/parcellation/' + self.inputs.parcellation_name  + '_expanded.nii.gz')
         outputs["subject_id"] = self.inputs.subject_id
         return outputs
 
@@ -413,96 +699,6 @@ class Extractb0(BaseInterface):
         outputs["out_file"] = os.path.abspath(base + '_b0.nii.gz')
         return outputs
 
-# ======================================================================
-# FA connectome construction
-
-
-class FAconnectomeInputSpec(BaseInterfaceInputSpec):
-    trackfile = File(
-        exists=True, desc='whole-brain tractography in .trk format', mandatory=True)
-    ROI_file = File(
-        exists=True, desc='image containing the ROIs', mandatory=True)
-    FA_file = File(
-        exists=True, desc='fractional anisotropy map in the same soace as the track file', mandatory=True)
-    output_file = File(
-        "FA_matrix.txt", desc="Adjacency matrix of ROIs with FA as conenction weight", usedefault=True)
-
-
-class FAconnectomeOutputSpec(TraitedSpec):
-    out_file = File(
-        exists=True, desc="connectivity matrix of FA between each pair of ROIs")
-
-
-class FAconnectome(BaseInterface):
-    input_spec = FAconnectomeInputSpec
-    output_spec = FAconnectomeOutputSpec
-
-    def _run_interface(self, runtime):
-        # Loading the ROI file
-        import nibabel as nib
-        import numpy as np
-        from dipy.tracking import utils
-
-        img = nib.load(self.inputs.ROI_file)
-        data = img.get_data()
-        affine = img.get_affine()
-
-        # Getting the FA file
-        img = nib.load(self.inputs.FA_file)
-        FA_data = img.get_data()
-        FA_affine = img.get_affine()
-
-        # Loading the streamlines
-        from nibabel import trackvis
-        streams, hdr = trackvis.read(
-            self.inputs.trackfile, points_space='rasmm')
-        streamlines = [s[0] for s in streams]
-        streamlines_affine = trackvis.aff_from_hdr(hdr, atleast_v2=True)
-
-        # Checking for negative values
-        from dipy.tracking._utils import _mapping_to_voxel, _to_voxel_coordinates
-        endpoints = [sl[0::len(sl) - 1] for sl in streamlines]
-        lin_T, offset = _mapping_to_voxel(affine, (1., 1., 1.))
-        inds = np.dot(endpoints, lin_T)
-        inds += offset
-        negative_values = np.where(inds < 0)[0]
-        for negative_value in sorted(negative_values, reverse=True):
-            del streamlines[negative_value]
-
-        # Constructing the streamlines matrix
-        matrix, mapping = utils.connectivity_matrix(
-            streamlines=streamlines, label_volume=data, affine=streamlines_affine, symmetric=True, return_mapping=True, mapping_as_streamlines=True)
-        matrix[matrix < 10] = 0
-
-        # Constructing the FA matrix
-        dimensions = matrix.shape
-        FA_matrix = np.empty(shape=dimensions)
-
-        for i in range(0, dimensions[0]):
-            for j in range(0, dimensions[1]):
-                if matrix[i, j]:
-                    dm = utils.density_map(
-                        mapping[i, j], FA_data.shape, affine=streamlines_affine)
-                    FA_matrix[i, j] = np.mean(FA_data[dm > 5])
-                else:
-                    FA_matrix[i, j] = 0
-
-        FA_matrix[np.tril_indices(n=len(FA_matrix))] = 0
-        FA_matrix = FA_matrix.T + FA_matrix - np.diagonal(FA_matrix)
-
-        from nipype.utils.filemanip import split_filename
-        _, base, _ = split_filename(self.inputs.trackfile)
-        np.savetxt(base + '_FA_matrix.txt', FA_matrix, delimiter='\t')
-        return runtime
-
-    def _list_outputs(self):
-        from nipype.utils.filemanip import split_filename
-        import os
-        outputs = self._outputs().get()
-        fname = self.inputs.trackfile
-        _, base, _ = split_filename(fname)
-        outputs["out_file"] = os.path.abspath(base + '_FA_matrix.txt')
-        return outputs
 
 # ==================================================================
 """
@@ -595,7 +791,7 @@ class ReunumberParcels(BaseInterface):
 
         wmpar1 = 1
         wmpar2 = 20
-        path_subj = self.inputs.subjects_dir + self.inputs.subject_id + '/'
+        path_subj = self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/'
         parcellation_name = self.inputs.parcellation_name
 
         vol = nib.load(path_subj + 'parcellation/' +
@@ -768,7 +964,7 @@ class ReunumberParcels(BaseInterface):
         from nipype.utils.filemanip import split_filename
         import os
         outputs = self._outputs().get()
-        path_subj = self.inputs.subjects_dir + self.inputs.subject_id + '/'
+        path_subj = self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/'
         parcellation_name = self.inputs.parcellation_name
 
         outputs["cortical"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical.nii.gz')
