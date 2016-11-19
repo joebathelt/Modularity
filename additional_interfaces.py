@@ -236,20 +236,22 @@ class CalcMatrix(BaseInterface):
 # ==================================================================
 # Deterministic trackign with a CSD model
 
-class CSDdetInputSpec(BaseInterfaceInputSpec):
+class TractographyInputSpec(BaseInterfaceInputSpec):
     in_file = File(exists=True, desc='diffusion weighted volume', mandatory=True)
     bval = File(exists=True, desc='FSL-style b-value file', mandatory=True)
     bvec = File(exists=True, desc='FSL-style b-vector file', mandatory=True)
     FA = File(exists=True, desc='FA map', mandatory=True)
     brain_mask = File(exists=True, desc='FA map', mandatory=True)
+    model = traits.String(desc='model to use for reconstruction, either CSA, CSD')
 
-class CSDdetOutputSpec(TraitedSpec):
+class TractographyOutputSpec(TraitedSpec):
     out_file = File(exists=True, desc="streamlines in NumPy format")
     out_track = File(exists=True, desc="tracks in Trackvis format")
+    GFA = File(exist=True, desc="Generalized fractional anisotropy image")
 
-class CSDdet(BaseInterface):
-    input_spec = CSDdetInputSpec
-    output_spec = CSDdetOutputSpec
+class Tractography(BaseInterface):
+    input_spec = TractographyInputSpec
+    output_spec = TractographyOutputSpec
 
     def _run_interface(self, runtime):
         import numpy as np
@@ -272,6 +274,7 @@ class CSDdet(BaseInterface):
         FA_fname = self.inputs.FA
         fname = self.inputs.in_file
         mask_fname = self.inputs.brain_mask
+        model = self.inputs.model
 
         # Loading the data
         img = nib.load(fname)
@@ -308,14 +311,35 @@ class CSDdet(BaseInterface):
                                      min_separation_angle=30,
                                      mask=white_matter)
         classifier = ThresholdTissueClassifier(csa_peaks.gfa, .1)
-        streamlines = LocalTracking(csa_peaks, classifier, seeds, affine, step_size=.5)
+
+        if model == 'CSA':
+            streamlines = LocalTracking(csa_peaks, classifier, seeds, affine, step_size=.5)
+
+        if model == 'CSD':
+            # CSD model
+            from dipy.reconst.csdeconv import auto_response
+            from dipy.reconst.csdeconv import ConstrainedSphericalDeconvModel
+            from dipy.direction import ProbabilisticDirectionGetter
+
+
+            response, ratio = auto_response(gtab, data, roi_radius=10, fa_thr=0.7)
+            csd_model = ConstrainedSphericalDeconvModel(gtab, response, sh_order=8)
+            csd_fit = csd_model.fit(data, mask=white_matter)
+
+            prob_dg = ProbabilisticDirectionGetter.from_shcoeff(csd_fit.shm_coeff, max_angle=45., sphere=default_sphere)
+
+            # Tracking
+            streamlines = LocalTracking(prob_dg, classifier, seeds, affine,step_size=.5, max_cross=2)
 
         # Compute streamlines and store as a list.
         streamlines = list(streamlines)
 
         # Saving the tracks in NumPy format
         _, base, _ = split_filename(fname)
-        np.save(base + '_CSDdet.npy', np.array(streamlines, dtype=np.object))
+        np.save(base + '_' + self.inputs.model + '.npy', np.array(streamlines, dtype=np.object))
+
+        # Saving the GFA image
+        nib.save(nib.Nifti1Image(csa_peaks.gfa, affine), base + '_GFA.nii.gz')
 
         # Make a trackvis header so we can save streamlines
         voxel_size = FA_img.get_header().get_zooms()
@@ -332,7 +356,7 @@ class CSDdet(BaseInterface):
 
         # Save streamlines in Trackvis format
         for_save = [(sl, None, None) for sl in streamlines]
-        nib.trackvis.write(base + '_CSDdet.trk', for_save, trackvis_header)
+        nib.trackvis.write(base + '_' + self.inputs.model + '.trk', for_save, trackvis_header)
         return runtime
 
     def _list_outputs(self):
@@ -342,8 +366,9 @@ class CSDdet(BaseInterface):
         outputs = self._outputs().get()
         fname = self.inputs.in_file
         _, base, _ = split_filename(fname)
-        outputs["out_file"] = os.path.abspath(base + '_CSDdet.npy')
-        outputs["out_track"] = os.path.abspath(base + '_CSDdet.trk')
+        outputs["out_file"] = os.path.abspath(base + '_' + self.inputs.model + '.npy')
+        outputs["out_track"] = os.path.abspath(base + '_' + self.inputs.model +'.trk')
+        outputs["GFA"] = os.path.abspath(base + '_GFA.nii.gz')
         return outputs
 
 # ==================================================================

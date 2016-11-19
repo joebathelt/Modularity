@@ -49,7 +49,8 @@ def main():
         import nipype.interfaces.dipy as dipy
         import nipype.interfaces.diffusion_toolkit as dtk
         import nipype.algorithms.misc as misc
-        from additional_interfaces import CSDdet
+        from nipype.interfaces.utility import Merge
+        from additional_interfaces import Tractography
         from additional_interfaces import DipyDenoise
         from additional_pipelines import DWIPreproc
         from additional_interfaces import CalcMatrix
@@ -94,8 +95,9 @@ def main():
         # Eroding the brain mask
         erode_mask = pe.Node(interface=fsl.maths.ErodeImage(), name='erode_mask')
 
-        # CSD deterministic tractography
-        csd_det = pe.Node(interface=CSDdet(), name='csd_det')
+        # Reconstruction and tractography
+        tractography = pe.Node(interface=Tractography(), name='tractography')
+        tractography.iterables = ('model', ['CSA', 'CSD'])
 
         # smoothing the tracts
         smooth = pe.Node(interface=dtk.SplineFilter(
@@ -117,9 +119,12 @@ def main():
         applyreg.inputs.interp = 'nearest'
         applyreg.inputs.inverse = True
 
+        # Merge outputs to pass on to CalcMatrix
+        merge = pe.Node(interface=Merge(3), name='merge')
+
         # calcuating the connectome matrix
-        calc_matrix = pe.Node(interface=CalcMatrix(), name='calc_matrix')
-        calc_matrix.inputs.threshold = 1
+        calc_matrix = pe.MapNode(interface=CalcMatrix(), name='calc_matrix', iterfield=['scalar_file'])
+        calc_matrix.threshold = 0
 
         # ==================================================================
         # Setting up the workflow
@@ -137,14 +142,14 @@ def main():
         # CSD model and streamline tracking
         connectome.connect(dwi_preproc, 'mask', erode_mask, 'in_file')
 
-        connectome.connect(selectfiles, 'bvec', csd_det, 'bvec')
-        connectome.connect(selectfiles, 'bval', csd_det, 'bval')
-        connectome.connect(dwi_preproc, 'dwi', csd_det, 'in_file')
-        connectome.connect(dwi_preproc, 'FA', csd_det, 'FA')
-        connectome.connect(erode_mask, 'out_file', csd_det, 'brain_mask')
+        connectome.connect(selectfiles, 'bvec', tractography, 'bvec')
+        connectome.connect(selectfiles, 'bval', tractography, 'bval')
+        connectome.connect(dwi_preproc, 'dwi', tractography, 'in_file')
+        connectome.connect(dwi_preproc, 'FA', tractography, 'FA')
+        connectome.connect(erode_mask, 'out_file', tractography, 'brain_mask')
 
         # Smoothing the trackfile
-        connectome.connect(csd_det, 'out_track', smooth, 'track_file')
+        connectome.connect(tractography, 'out_track', smooth, 'track_file')
 
         # Preprocessing the T1-weighted file
         connectome.connect(infosource, 'subject_id', t1_preproc, 'subject_id')
@@ -163,8 +168,11 @@ def main():
         connectome.connect(subject_parcellation, 'renum_expanded', applyreg, 'target_file')
 
         # Calculating the FA connectome
-        connectome.connect(csd_det, 'out_file', calc_matrix, 'track_file')
-        connectome.connect(dwi_preproc, 'FA', calc_matrix, 'scalar_file')
+        connectome.connect(tractography, 'out_file', calc_matrix, 'track_file')
+        connectome.connect(dwi_preproc, 'FA', merge, 'in1')
+        connectome.connect(dwi_preproc, 'RD', merge, 'in2')
+        connectome.connect(tractography, 'GFA', merge, 'in3')
+        connectome.connect(merge, 'out', calc_matrix, 'scalar_file')
         connectome.connect(applyreg, 'transformed_file', calc_matrix, 'ROI_file')
 
         # ==================================================================
