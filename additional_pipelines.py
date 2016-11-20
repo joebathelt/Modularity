@@ -208,11 +208,6 @@ class T1Preproc(BaseInterface):
         # Denoising
         T1_denoise = pe.Node(interface=DipyDenoiseT1(), name='T1_denoise')
 
-        # Bias field correction
-        n4 = pe.Node(interface=N4BiasFieldCorrection(), name='n4')
-        n4.inputs.dimension = 3
-        n4.inputs.save_bias = True
-
         # Brain extraction
         brainextraction = pe.Node(
             interface=BrainExtraction(), name='brainextraction')
@@ -253,9 +248,7 @@ class T1Preproc(BaseInterface):
         T1_preproc = pe.Workflow(name='t1_preproc')
 
         T1_preproc.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
-        T1_preproc.connect(T1_denoise, 'out_file', n4, 'input_image')
-        T1_preproc.connect(
-            n4, 'output_image', brainextraction, 'anatomical_image')
+        T1_preproc.connect(T1_denoise, 'out_file', brainextraction, 'anatomical_image')
         T1_preproc.connect(
             brainextraction, 'BrainExtractionBrain', autorecon1, 'T1_files')
         T1_preproc.connect(

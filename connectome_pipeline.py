@@ -124,7 +124,7 @@ def main():
 
         # calcuating the connectome matrix
         calc_matrix = pe.MapNode(interface=CalcMatrix(), name='calc_matrix', iterfield=['scalar_file'])
-        calc_matrix.threshold = 0
+        calc_matrix.iterables = ('threshold', [0, 1, 5, 10])
 
         # ==================================================================
         # Setting up the workflow
