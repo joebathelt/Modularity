@@ -209,12 +209,7 @@ class T1Preproc(BaseInterface):
         T1_denoise = pe.Node(interface=DipyDenoiseT1(), name='T1_denoise')
 
         # Brain extraction
-        brainextraction = pe.Node(
-            interface=BrainExtraction(), name='brainextraction')
-        brainextraction.inputs.dimension = 3
-        brainextraction.inputs.brain_template = template_directory + '/T_template.nii.gz'
-        brainextraction.inputs.brain_probability_mask = template_directory + \
-            '/T_template_BrainCerebellumProbabilityMask.nii.gz'
+        brainextraction = pe.Node(interface=fsl.BET(), name='brainextraction')
 
         # Renaming files for FreeSurfer
         rename = pe.Node(FSRename(), name='rename')
@@ -248,9 +243,9 @@ class T1Preproc(BaseInterface):
         T1_preproc = pe.Workflow(name='t1_preproc')
 
         T1_preproc.connect(robustfov, 'out_roi', T1_denoise, 'in_file')
-        T1_preproc.connect(T1_denoise, 'out_file', brainextraction, 'anatomical_image')
+        T1_preproc.connect(T1_denoise, 'out_file', brainextraction, 'in_file')
         T1_preproc.connect(
-            brainextraction, 'BrainExtractionBrain', autorecon1, 'T1_files')
+            brainextraction, 'out_file', autorecon1, 'T1_files')
         T1_preproc.connect(
             autorecon1, 'subject_id', autorecon2, 'subject_id')
         T1_preproc.connect(
