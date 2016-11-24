@@ -6,6 +6,7 @@ import sys
 
 
 # ======================================================================
+sys.path.append('/home/jb07/joe_python/GitHub/Modularity/')
 
 def main():
     p = optparse.OptionParser()
@@ -50,6 +51,7 @@ def main():
         import nipype.interfaces.diffusion_toolkit as dtk
         import nipype.algorithms.misc as misc
         from nipype.interfaces.utility import Merge
+        import numpy as np
         from additional_interfaces import Tractography
         from additional_interfaces import DipyDenoise
         from additional_pipelines import DWIPreproc
@@ -124,7 +126,7 @@ def main():
 
         # calcuating the connectome matrix
         calc_matrix = pe.MapNode(interface=CalcMatrix(), name='calc_matrix', iterfield=['scalar_file'])
-        calc_matrix.iterables = ('threshold', [0, 1, 5, 10])
+        calc_matrix.iterables = ('threshold', np.arange(0,100,10))
 
         # ==================================================================
         # Setting up the workflow

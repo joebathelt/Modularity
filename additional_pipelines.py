@@ -4,7 +4,6 @@ from nipype.interfaces.base import File
 from nipype.interfaces.base import traits
 from nipype.interfaces.base import TraitedSpec
 
-
 # ======================================================================
 # DWI preprocessing
 
@@ -135,6 +134,7 @@ class DWIPreproc(BaseInterface):
         # Running the workflow
         dwi_preproc.base_dir = os.path.abspath(self.inputs.out_directory + '_subject_id_' + self.inputs.subject_id)
         dwi_preproc.write_graph()
+        dwi_preproc.write_graph()
         dwi_preproc.run()
 
         return runtime
@@ -153,6 +153,148 @@ class DWIPreproc(BaseInterface):
         outputs["mask"] = os.path.abspath('preprocessed/' + subject_id + '_mask.nii.gz')
 
         return outputs
+
+# ======================================================================
+# Parcellation
+
+class SubjectSpaceParcellationInputSpec(BaseInterfaceInputSpec):
+    subject_id = traits.String(desc='subject ID')
+    subjects_dir = File(exist=True, desc='FreeSufer subject directory')
+    source_subject = traits.String(desc='subject ID')
+    source_annot_file = File(exist=True, desc='annotation file to be transformed')
+    parcellation_directory = File(desc='directory containing the subjects parcellations')
+    out_directory = File(
+        exist=True, desc='directory where FreeSurfer output should be directed')
+    wm = File(exit=True, desc='segmented white matter image')
+
+class SubjectSpaceParcellationOutputSpec(TraitedSpec):
+    subject_id = traits.String(desc='subject ID')
+    subjects_dir = File(exist=True, desc='FreeSufer subject directory')
+    aparc = traits.String(desc="parcellation file")
+    aparc_subMask = File(exists=True, desc="DK atlas with subcortical regions masked out")
+    cortical = File(exists=True, desc="cortical parcellation")
+    cortical_consecutive = File(exists=True, desc="cortical parcellation with consecutive numbering")
+    cortical_expanded = File(exists=True, desc="cortical parcellation expanded into WM")
+    cortical_expanded_consecutive = File(exists=True, desc="cortical parcellation expanded into WM with consecutive numbering")
+    leftHemisphere = File(exists=True, desc="left hemisphere parcellation")
+    leftHemisphere_expanded = File(exists=True, desc="left hemisphere parcellation expanded into WM")
+    orig = File(exists=True, desc="original parcellation image")
+    renum = File(exists=True, desc="renumbered parcellation")
+    renum_expanded = File(exists=True, desc="renumbered parcellation expanded into WM")
+    renum_subMask = File(exists=True, desc="renumbered parcellation with subcortical regions masked out")
+    rightHemisphere = File(exists=True, desc="parcellation of the right hemisphere")
+    rightHemisphere_expanded = File(exists=True, desc="parcellation of the right hemisphere expanded into WM")
+    subcortical = File(exists=True, desc="parcellation of subcortical regions")
+    subcortical_expanded = File(exists=True, desc="parcellation of subcortical regions expanded into WM")
+    whiteMatter = File(exists=True, desc="white matter partial volume")
+    whiteMatter_expanded = File(exists=True, desc="white matter partial image after expansion of cortical parcellation into WM")
+    boundary_lh_rh = File(exists=True, desc="boundary label between hemisphere")
+    boundary_sub_lh = File(exists=True, desc="oundary label between cortical and subcortical")
+
+class SubjectSpaceParcellation(BaseInterface):
+    input_spec = SubjectSpaceParcellationInputSpec
+    output_spec = SubjectSpaceParcellationOutputSpec
+
+    def _run_interface(self, runtime):
+
+        from additional_interfaces import Aparc2Aseg
+        from additional_interfaces import ExpandParcels
+        from additional_interfaces import SurfaceTransform
+        from additional_interfaces import ReunumberParcels
+        import nipype.pipeline.engine as pe
+        import os
+
+        subject_id = self.inputs.subject_id
+        subjects_dir = self.inputs.subjects_dir
+        source_subject = self.inputs.source_subject
+        source_annot_file = self.inputs.source_annot_file
+        parcellation_directory = self.inputs.parcellation_directory
+        wm = self.inputs.wm
+
+        if subjects_dir[:-1] == '/':
+            subjects_dir = subjects_dir + '/'
+
+        os.environ['SUBJECTS_DIR'] = subjects_dir
+
+        if not os.path.isdir(subjects_dir + '/' + source_subject):
+            os.symlink(parcellation_directory + '/' + source_subject, subjects_dir + '/' + source_subject)
+
+        # Moving subparcellation of the atlas to subject space
+        sxfm = pe.Node(interface=SurfaceTransform(), name='sxfm')
+        sxfm.inputs.subject_id = subject_id
+        sxfm.inputs.target_subject = subject_id
+        sxfm.inputs.source_annot_file = source_annot_file
+        sxfm.inputs.source_subject = source_subject
+        sxfm.inputs.subjects_dir = subjects_dir
+        sxfm.iterables = ('hemi', ['lh', 'rh'])
+
+        # Transforming surface parcellation to volume
+        aparc2aseg = pe.Node(interface=Aparc2Aseg(), name='aparc2aseg')
+        aparc2aseg.inputs.subjects_dir = subjects_dir + '/'
+        aparc2aseg.inputs.annotation_file = source_annot_file
+        aparc2aseg.inputs.hemi = 'lh'
+
+        # Dilating parcellation into the white matter
+        expand = pe.Node(interface=ExpandParcels(), name='expand')
+        expand.inputs.white_matter_image = wm
+        expand.inputs.subjects_dir = subjects_dir
+        expand.inputs.parcellation_name = source_annot_file
+        expand.inputs.dilatationVoxel = 2
+
+        renum = pe.Node(interface=ReunumberParcels(), name='renum')
+        renum.inputs.subjects_dir = subjects_dir
+        renum.inputs.parcellation_name = source_annot_file
+
+        # Connecting the pipeline
+        subject_parcellation = pe.Workflow(name='subject_parcellation')
+
+        subject_parcellation.connect(
+            sxfm, 'subject_id', aparc2aseg, 'subject_id')
+        subject_parcellation.connect(
+            aparc2aseg, 'volume_parcellation', expand, 'parcellation_file')
+        subject_parcellation.connect(
+            sxfm, 'subject_id', expand, 'subject_id')
+        subject_parcellation.connect(
+                expand, 'subject_id', renum, 'subject_id')
+
+        # ==============================================================
+        # Running the workflow
+        subject_parcellation.base_dir = os.path.abspath(self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id)
+        subject_parcellation.run()
+
+        return runtime
+
+    def _list_outputs(self):
+        from nipype.utils.filemanip import split_filename
+        import os
+
+        outputs = self._outputs().get()
+        path_subj = self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/'
+        parcellation_name = self.inputs.source_annot_file
+
+        outputs["aparc"] = self.inputs.source_annot_file
+        outputs["cortical"] = os.path.abspath(path_subj + '/parcellation/' + parcellation_name + '_cortical.nii.gz')
+        outputs["cortical_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_consecutive.nii.gz')
+        outputs["cortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_expanded.nii.gz')
+        outputs["cortical_expanded_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_cortical_expanded_consecutive.nii.gz')
+        outputs["leftHemisphere"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_leftHemisphere.nii.gz')
+        outputs["leftHemisphere_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_leftHemisphere_expanded.nii.gz')
+        outputs["orig"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_orig.nii.gz')
+        outputs["renum"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum.nii.gz')
+        outputs["renum_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum_expanded.nii.gz')
+        outputs["renum_subMask"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum_subMask.nii.gz')
+        outputs["rightHemisphere"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_rightHemisphere.nii.gz')
+        outputs["rightHemisphere_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_rightHemisphere_expanded.nii.gz')
+        outputs["subcortical"] = os.path.abspath(path_subj + 'parcellation/' +parcellation_name +  '_subcortical.nii.gz')
+        outputs["subcortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_subcortical_expanded.nii.gz')
+        outputs["subject_id"] = self.inputs.subject_id
+        outputs["subjects_dir"] = self.inputs.subjects_dir
+        outputs["whiteMatter"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter.nii.gz')
+        outputs["whiteMatter_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter_expanded.nii.gz')
+        outputs["boundary_lh_rh"] = os.path.abspath(path_subj + 'parcellation/' + 'boundary_lh_rh.txt')
+        outputs["boundary_sub_lh"] = os.path.abspath(path_subj + 'parcellation/' + 'boundary_sub_lh.txt')
+        return outputs
+
 
 # ======================================================================
 # T1 preprocessing & FreeSurfer reconstruction
@@ -266,6 +408,7 @@ class T1Preproc(BaseInterface):
         # ==============================================================
         # Running the workflow
         T1_preproc.base_dir = os.path.abspath(self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id)
+        T1_preproc.write_graph()
         T1_preproc.run()
 
         return runtime
@@ -283,143 +426,3 @@ class T1Preproc(BaseInterface):
 
         return outputs
 
-
-# ======================================================================
-# Parcellation
-
-class SubjectSpaceParcellationInputSpec(BaseInterfaceInputSpec):
-    subject_id = traits.String(desc='subject ID')
-    subjects_dir = File(exist=True, desc='FreeSufer subject directory')
-    source_subject = traits.String(desc='subject ID')
-    source_annot_file = File(exist=True, desc='annotation file to be transformed')
-    parcellation_directory = File(desc='directory containing the subjects parcellations')
-    out_directory = File(
-        exist=True, desc='directory where FreeSurfer output should be directed')
-    wm = File(exit=True, desc='segmented white matter image')
-
-class SubjectSpaceParcellationOutputSpec(TraitedSpec):
-    subject_id = traits.String(desc='subject ID')
-    subjects_dir = File(exist=True, desc='FreeSufer subject directory')
-    aparc = traits.String(desc="parcellation file")
-    aparc_subMask = File(exists=True, desc="DK atlas with subcortical regions masked out")
-    cortical = File(exists=True, desc="cortical parcellation")
-    cortical_consecutive = File(exists=True, desc="cortical parcellation with consecutive numbering")
-    cortical_expanded = File(exists=True, desc="cortical parcellation expanded into WM")
-    cortical_expanded_consecutive = File(exists=True, desc="cortical parcellation expanded into WM with consecutive numbering")
-    leftHemisphere = File(exists=True, desc="left hemisphere parcellation")
-    leftHemisphere_expanded = File(exists=True, desc="left hemisphere parcellation expanded into WM")
-    orig = File(exists=True, desc="original parcellation image")
-    renum = File(exists=True, desc="renumbered parcellation")
-    renum_expanded = File(exists=True, desc="renumbered parcellation expanded into WM")
-    renum_subMask = File(exists=True, desc="renumbered parcellation with subcortical regions masked out")
-    rightHemisphere = File(exists=True, desc="parcellation of the right hemisphere")
-    rightHemisphere_expanded = File(exists=True, desc="parcellation of the right hemisphere expanded into WM")
-    subcortical = File(exists=True, desc="parcellation of subcortical regions")
-    subcortical_expanded = File(exists=True, desc="parcellation of subcortical regions expanded into WM")
-    whiteMatter = File(exists=True, desc="white matter partial volume")
-    whiteMatter_expanded = File(exists=True, desc="white matter partial image after expansion of cortical parcellation into WM")
-    boundary_lh_rh = File(exists=True, desc="boundary label between hemisphere")
-    boundary_sub_lh = File(exists=True, desc="oundary label between cortical and subcortical")
-
-class SubjectSpaceParcellation(BaseInterface):
-    input_spec = SubjectSpaceParcellationInputSpec
-    output_spec = SubjectSpaceParcellationOutputSpec
-
-    def _run_interface(self, runtime):
-        from additional_interfaces import Aparc2Aseg
-        from additional_interfaces import ExpandParcels
-        from additional_interfaces import SurfaceTransform
-        from additional_interfaces import ReunumberParcels
-        import nipype.pipeline.engine as pe
-        import os
-
-        subject_id = self.inputs.subject_id
-        subjects_dir = self.inputs.subjects_dir
-        source_subject = self.inputs.source_subject
-        source_annot_file = self.inputs.source_annot_file
-        parcellation_directory = self.inputs.parcellation_directory
-        wm = self.inputs.wm
-
-        if subjects_dir[:-1] == '/':
-            subjects_dir = subjects_dir + '/'
-
-        os.environ['SUBJECTS_DIR'] = subjects_dir
-
-        if not os.path.isdir(subjects_dir + '/' + source_subject):
-            os.symlink(parcellation_directory + '/' + source_subject, subjects_dir + '/' + source_subject)
-
-        # Moving subparcellation of the atlas to subject space
-        sxfm = pe.Node(interface=SurfaceTransform(), name='sxfm')
-        sxfm.inputs.subject_id = subject_id
-        sxfm.inputs.target_subject = subject_id
-        sxfm.inputs.source_annot_file = source_annot_file
-        sxfm.inputs.source_subject = source_subject
-        sxfm.inputs.subjects_dir = subjects_dir
-        sxfm.iterables = ('hemi', ['lh', 'rh'])
-
-        # Transforming surface parcellation to volume
-        aparc2aseg = pe.Node(interface=Aparc2Aseg(), name='aparc2aseg')
-        aparc2aseg.inputs.subjects_dir = subjects_dir + '/'
-        aparc2aseg.inputs.annotation_file = source_annot_file
-        aparc2aseg.inputs.hemi = 'lh'
-
-        # Dilating parcellation into the white matter
-        expand = pe.Node(interface=ExpandParcels(), name='expand')
-        expand.inputs.white_matter_image = wm
-        expand.inputs.subjects_dir = subjects_dir
-        expand.inputs.parcellation_name = source_annot_file
-        expand.inputs.dilatationVoxel = 2
-
-        renum = pe.Node(interface=ReunumberParcels(), name='renum')
-        renum.inputs.subjects_dir = subjects_dir
-        renum.inputs.parcellation_name = source_annot_file
-
-        # Connecting the pipeline
-        subject_parcellation = pe.Workflow(name='subject_parcellation')
-
-        subject_parcellation.connect(
-            sxfm, 'subject_id', aparc2aseg, 'subject_id')
-        subject_parcellation.connect(
-            aparc2aseg, 'volume_parcellation', expand, 'parcellation_file')
-        subject_parcellation.connect(
-            sxfm, 'subject_id', expand, 'subject_id')
-        subject_parcellation.connect(
-                expand, 'subject_id', renum, 'subject_id')
-
-        # ==============================================================
-        # Running the workflow
-        subject_parcellation.base_dir = os.path.abspath(self.inputs.out_directory + '/_subject_id_' + self.inputs.subject_id)
-        subject_parcellation.run()
-
-        return runtime
-
-    def _list_outputs(self):
-        from nipype.utils.filemanip import split_filename
-        import os
-
-        outputs = self._outputs().get()
-        path_subj = self.inputs.subjects_dir + '/' + self.inputs.subject_id + '/'
-        parcellation_name = self.inputs.source_annot_file
-
-        outputs["aparc"] = self.inputs.source_annot_file
-        outputs["cortical"] = os.path.abspath(path_subj + '/parcellation/' + parcellation_name + '_cortical.nii.gz')
-        outputs["cortical_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_consecutive.nii.gz')
-        outputs["cortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_cortical_expanded.nii.gz')
-        outputs["cortical_expanded_consecutive"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_cortical_expanded_consecutive.nii.gz')
-        outputs["leftHemisphere"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_leftHemisphere.nii.gz')
-        outputs["leftHemisphere_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_leftHemisphere_expanded.nii.gz')
-        outputs["orig"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_orig.nii.gz')
-        outputs["renum"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum.nii.gz')
-        outputs["renum_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum_expanded.nii.gz')
-        outputs["renum_subMask"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_renum_subMask.nii.gz')
-        outputs["rightHemisphere"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_rightHemisphere.nii.gz')
-        outputs["rightHemisphere_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_rightHemisphere_expanded.nii.gz')
-        outputs["subcortical"] = os.path.abspath(path_subj + 'parcellation/' +parcellation_name +  '_subcortical.nii.gz')
-        outputs["subcortical_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name +  '_subcortical_expanded.nii.gz')
-        outputs["subject_id"] = self.inputs.subject_id
-        outputs["subjects_dir"] = self.inputs.subjects_dir
-        outputs["whiteMatter"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter.nii.gz')
-        outputs["whiteMatter_expanded"] = os.path.abspath(path_subj + 'parcellation/' + parcellation_name + '_whiteMatter_expanded.nii.gz')
-        outputs["boundary_lh_rh"] = os.path.abspath(path_subj + 'parcellation/' + 'boundary_lh_rh.txt')
-        outputs["boundary_sub_lh"] = os.path.abspath(path_subj + 'parcellation/' + 'boundary_sub_lh.txt')
-        return outputs

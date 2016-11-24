@@ -143,27 +143,27 @@ class CalcMatrix(BaseInterface):
         import numpy as np
         from dipy.tracking import utils
 
+        # Identity matrix affine
+        affine = np.eye(4)
 
         img = nib.load(self.inputs.ROI_file)
-        labels = img.get_data()
-        labels_affine = img.get_affine()
+        labels = nib.Nifti1Image(img.get_data(), affine).get_data()
 
         # Getting the scalar data
         img = nib.load(self.inputs.scalar_file)
-        scalar_data = img.get_data()
-        scalar_affine = img.get_affine()
-        scalar_affine = np.matrix.round(scalar_affine)
+        scalar_data = nib.Nifti1Image(img.get_data(), affine).get_data()
 
         # Loading the streamlines
         streamlines = np.load(self.inputs.track_file)
 
+
         # Only keeping streamlines that pass through the ROIs
         ROI_mask = labels > 0
-        target_streamlines = utils.target(streamlines, ROI_mask, affine=scalar_affine)
+        target_streamlines = utils.target(streamlines, ROI_mask, affine=affine)
 
         # Constructing the streamlines matrix
         matrix, mapping = utils.connectivity_matrix(
-            streamlines=target_streamlines, label_volume=labels.astype('int'), affine=scalar_affine, symmetric=True, return_mapping=True, mapping_as_streamlines=True)
+            streamlines=target_streamlines, label_volume=labels.astype('int'), affine=affine, symmetric=True, return_mapping=True, mapping_as_streamlines=True)
         matrix[matrix < self.inputs.threshold] = 0
 
         # Removing the background label
@@ -205,7 +205,7 @@ class CalcMatrix(BaseInterface):
             for j in range(0, dimensions[1]):
                 if matrix[i, j]:
                     dm = utils.density_map(
-                        mapping[i, j], scalar_data.shape, affine=scalar_affine)
+                        mapping[i, j], scalar_data.shape, affine=affine)
                     scalar_matrix[i, j] = np.mean(scalar_data[dm > 5])
                 else:
                     scalar_matrix[i, j] = 0
@@ -230,7 +230,7 @@ class CalcMatrix(BaseInterface):
         outputs["density_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix.txt')
 
         outputs["length_normalized_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix_length_normalized.txt')
-        outputs["size_normalized_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix_ROI_normalized')
+        outputs["size_normalized_matrix"] = os.path.abspath(base + '_' + str(self.inputs.threshold) + '_matrix_ROI_normalized.txt')
         return outputs
 
 # ==================================================================
@@ -279,12 +279,9 @@ class Tractography(BaseInterface):
         # Loading the data
         img = nib.load(fname)
         data = img.get_data()
-        affine = img.get_affine()
 
         FA_img = nib.load(FA_fname)
         fa = FA_img.get_data()
-        affine = FA_img.get_affine()
-        affine = np.matrix.round(affine)
 
         mask_img = nib.load(mask_fname)
         mask = mask_img.get_data()
@@ -294,15 +291,18 @@ class Tractography(BaseInterface):
 
         bvec_fname = self.inputs.bvec
         bvecs = np.loadtxt(bvec_fname)
-        bvecs = np.vstack([-1*bvecs[0,:],bvecs[1,:],bvecs[2,:]]).T
+        #bvecs = np.vstack([-1*bvecs[0,:],bvecs[1,:],bvecs[2,:]]).T
+        bvecs = np.vstack([bvecs[0,:],bvecs[1,:],bvecs[2,:]]).T
         gtab = gradient_table(bvals, bvecs)
 
         # Creating a white matter mask
         fa = fa*mask
         white_matter = fa >= 0.2
 
+        affine = np.eye(4)
+
         # Creating a seed mask
-        seeds = utils.seeds_from_mask(white_matter, density=1, affine=affine)
+        seeds = utils.seeds_from_mask(white_matter, density=[1,1,1])
 
         # Fitting the CSA model
         csa_model = CsaOdfModel(gtab, sh_order=8)
@@ -313,7 +313,7 @@ class Tractography(BaseInterface):
         classifier = ThresholdTissueClassifier(csa_peaks.gfa, .1)
 
         if model == 'CSA':
-            streamlines = LocalTracking(csa_peaks, classifier, seeds, affine, step_size=.5)
+            streamlines = LocalTracking(csa_peaks, classifier, seeds, np.eye(4), step_size=.5)
 
         if model == 'CSD':
             # CSD model
@@ -339,7 +339,7 @@ class Tractography(BaseInterface):
         np.save(base + '_' + self.inputs.model + '.npy', np.array(streamlines, dtype=np.object))
 
         # Saving the GFA image
-        nib.save(nib.Nifti1Image(csa_peaks.gfa, affine), base + '_GFA.nii.gz')
+        nib.save(nib.Nifti1Image(csa_peaks.gfa, FA_img.affine), base + '_GFA.nii.gz')
 
         # Make a trackvis header so we can save streamlines
         voxel_size = FA_img.get_header().get_zooms()
@@ -1061,38 +1061,4 @@ class SurfaceTransform(BaseInterface):
         outputs['trgsurf'] = os.path.abspath(
             subject_directory + '/' + target_subject + '/label/' + hemisphere + '.' + annotation_file + '.annot')
         outputs['subject_id'] = self.inputs.subject_id
-        return outputs
-
-# =====================================================================
-# Moving tracts to a different space
-
-class trk_CoregInputSpec(CommandLineInputSpec):
-    in_file = File(exists=True, desc='whole-brain tractography in .trk format',
-                   mandatory=True, position=0, argstr="%s")
-    output_file = File("coreg_tracks.trk", desc="whole-brain tractography in coregistered space",
-                       position=1, argstr="%s", usedefault=True)
-    FA_file = File(exists=True, desc='FA file in the same space as the .trk file',
-                   mandatory=True, position=2, argstr="-src %s")
-    reference = File(exists=True, desc='Image that the .trk file will be registered to',
-                     mandatory=True, position=3, argstr="-ref %s")
-    transfomation_matrix = File(exists=True, desc='FSL matrix with transform form original to new space',
-                                mandatory=True, position=4, argstr="-reg %s")
-
-
-class trk_CoregOutputSpec(TraitedSpec):
-    transformed_track_file = File(
-        exists=True, desc="whole-brain tractography in new space")
-
-
-class trk_Coreg(CommandLine):
-    input_spec = trk_CoregInputSpec
-    output_spec = trk_CoregOutputSpec
-
-    _cmd = "track_transform"
-
-    def _list_outputs(self):
-        import os
-        outputs = self.output_spec().get()
-        outputs['transformed_track_file'] = os.path.abspath(
-            self.inputs.output_file)
         return outputs
