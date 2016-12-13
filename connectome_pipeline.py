@@ -47,18 +47,17 @@ def main():
         from nipype.interfaces.freesurfer import ApplyVolTransform
         from nipype.interfaces.freesurfer import BBRegister
         import nipype.interfaces.fsl as fsl
-        import nipype.interfaces.dipy as dipy
         import nipype.interfaces.diffusion_toolkit as dtk
-        import nipype.algorithms.misc as misc
         from nipype.interfaces.utility import Merge
         import numpy as np
-        from additional_interfaces import Tractography
-        from additional_interfaces import DipyDenoise
-        from additional_pipelines import DWIPreproc
+        from additional_interfaces import AtlasValues
+        from additional_interfaces import AparcStats
         from additional_interfaces import CalcMatrix
-        from additional_pipelines import T1Preproc
+        from additional_interfaces import FreeSurferValues
+        from additional_interfaces import Tractography
+        from additional_pipelines import DWIPreproc
         from additional_pipelines import SubjectSpaceParcellation
-        from own_nipype import Extractb0 as extract_b0
+        from additional_pipelines import T1Preproc
 
         from nipype import SelectFiles
         import os
@@ -128,6 +127,19 @@ def main():
         calc_matrix = pe.MapNode(interface=CalcMatrix(), name='calc_matrix', iterfield=['scalar_file'])
         calc_matrix.iterables = ('threshold', np.arange(0,100,10))
 
+        # Getting values of diffusion measures
+        FA_values = pe.Node(interface=AtlasValues(), name='FA_values')
+        RD_values = pe.Node(interface=AtlasValues(), name='RD_values')
+        AD_values = pe.Node(interface=AtlasValues(), name='AD_values')
+        MD_values = pe.Node(interface=AtlasValues(), name='MD_values')
+
+        # Getting additional surface measures
+        aparcstats = pe.Node(interface=AparcStats(), name='aparcstats')
+        aparcstats.inputs.parcellation_name = 'aparc'
+
+        freesurfer_values = pe.Node(interface=FreeSurferValues(), name='freesurfer_values')
+        freesurfer_values.inputs.parcellation_name = 'aparc'
+
         # ==================================================================
         # Setting up the workflow
         connectome = pe.Workflow(name='connectome')
@@ -176,6 +188,22 @@ def main():
         connectome.connect(tractography, 'GFA', merge, 'in3')
         connectome.connect(merge, 'out', calc_matrix, 'scalar_file')
         connectome.connect(applyreg, 'transformed_file', calc_matrix, 'ROI_file')
+
+        # Getting values for additional measures
+        connectome.connect(dwi_preproc, 'FA', FA_values, 'morpho_filename')
+        connectome.connect(dwi_preproc, 'RD', RD_values, 'morpho_filename')
+        connectome.connect(dwi_preproc, 'AD', AD_values, 'morpho_filename')
+        connectome.connect(dwi_preproc, 'MD', MD_values, 'morpho_filename')
+        connectome.connect(applyreg, 'transformed_file', FA_values, 'atlas_filename')
+        connectome.connect(applyreg, 'transformed_file', RD_values, 'atlas_filename')
+        connectome.connect(applyreg, 'transformed_file', AD_values, 'atlas_filename')
+        connectome.connect(applyreg, 'transformed_file', MD_values, 'atlas_filename')
+
+        # Getting FreeSurfer morphological values
+        connectome.connect(t1_preproc, 'subject_id', aparcstats, 'subject_id')
+        connectome.connect(t1_preproc, 'subjects_dir', aparcstats, 'subjects_dir')
+        connectome.connect(aparcstats, 'lh_stats', freesurfer_values, 'lh_filename')
+        connectome.connect(aparcstats, 'rh_stats', freesurfer_values, 'rh_filename')
 
         # ==================================================================
         # Running the workflow
