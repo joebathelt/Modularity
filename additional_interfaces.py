@@ -254,7 +254,6 @@ class CalcMatrix(BaseInterface):
     output_spec = CalcMatrixOutputSpec
 
     def _run_interface(self, runtime):
-        # Loading the ROI file
         import nibabel as nib
         import numpy as np
         from dipy.tracking import utils
@@ -262,6 +261,7 @@ class CalcMatrix(BaseInterface):
         # Identity matrix affine
         affine = np.eye(4)
 
+        # Loading the ROI file
         img = nib.load(self.inputs.ROI_file)
         labels = nib.Nifti1Image(img.get_data(), affine).get_data()
 

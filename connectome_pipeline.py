@@ -7,6 +7,7 @@ import sys
 
 # ======================================================================
 sys.path.append('/home/jb07/joe_python/GitHub/Modularity/')
+sys.path.append('/home/jb07/python_modules/')
 
 def main():
     p = optparse.OptionParser()
@@ -125,7 +126,7 @@ def main():
 
         # calcuating the connectome matrix
         calc_matrix = pe.MapNode(interface=CalcMatrix(), name='calc_matrix', iterfield=['scalar_file'])
-        calc_matrix.iterables = ('threshold', np.arange(0,100,10))
+        calc_matrix.iterables = ('threshold', np.arange(0,20,10))
 
         # Getting values of diffusion measures
         FA_values = pe.Node(interface=AtlasValues(), name='FA_values')
